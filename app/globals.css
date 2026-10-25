@@ -175,6 +175,8 @@ button { cursor: pointer; }
   transform: translate(-2px, -2px);
   transition: left 45ms linear, top 45ms linear;
 }
+/* The local cursor tracks the real pointer directly; easing it only adds lag. */
+.remote-cursor.local { transition: none; }
 .cursor-arrow {
   display: block;
   width: 19px;

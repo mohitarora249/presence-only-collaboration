@@ -31,6 +31,7 @@ type PresenceSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
 const DEFAULT_NAME = `Guest ${Math.floor(100 + Math.random() * 900)}`;
 const DEFAULT_ROOM = "team-room";
+const MOVE_SEND_INTERVAL_MS = 35;
 
 function initials(name: string) {
   return name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "?";
@@ -50,6 +51,7 @@ export default function PresencePlayground() {
   const lastMoveSentAt = useRef(0);
   const pendingPosition = useRef<{ x: number; y: number } | null>(null);
   const frameRef = useRef<number | null>(null);
+  const trailingTimerRef = useRef<number | null>(null);
 
   const [nameInput, setNameInput] = useState(DEFAULT_NAME);
   const [roomInput, setRoomInput] = useState(DEFAULT_ROOM);
@@ -122,6 +124,7 @@ export default function PresencePlayground() {
       socket.disconnect();
       socketRef.current = null;
       if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+      if (trailingTimerRef.current !== null) clearTimeout(trailingTimerRef.current);
     };
   }, []);
 
@@ -156,6 +159,14 @@ export default function PresencePlayground() {
     }
   }, [nameInput, roomInput]);
 
+  const sendPendingMove = useCallback(() => {
+    const position = pendingPosition.current;
+    if (!position) return;
+    socketRef.current?.emit("presence:move", position);
+    pendingPosition.current = null;
+    lastMoveSentAt.current = Date.now();
+  }, []);
+
   const handleCanvasMove = useCallback((event: MouseEvent<HTMLDivElement>) => {
     const canvas = canvasRef.current;
     if (!canvas || !joined) return;
@@ -168,20 +179,31 @@ export default function PresencePlayground() {
     pendingPosition.current = { x, y };
 
     // Coalesce high-frequency pointer events to at most one send per animation frame,
-    // with a small time gate to avoid flooding the socket.
-    if (frameRef.current !== null) return;
+    // with a small time gate to avoid flooding the socket. A send already scheduled
+    // (frame or trailing timer) will pick up the latest pendingPosition.
+    if (frameRef.current !== null || trailingTimerRef.current !== null) return;
     frameRef.current = requestAnimationFrame(() => {
       frameRef.current = null;
-      const now = Date.now();
-      if (now - lastMoveSentAt.current < 35) return;
-      const position = pendingPosition.current;
-      if (!position) return;
-      socketRef.current?.emit("presence:move", position);
-      lastMoveSentAt.current = now;
+      const wait = MOVE_SEND_INTERVAL_MS - (Date.now() - lastMoveSentAt.current);
+      if (wait <= 0) {
+        sendPendingMove();
+        return;
+      }
+      // Too soon to send: schedule a trailing send instead of dropping the position,
+      // so the final resting point always reaches other clients.
+      trailingTimerRef.current = window.setTimeout(() => {
+        trailingTimerRef.current = null;
+        sendPendingMove();
+      }, wait);
     });
-  }, [joined]);
+  }, [joined, sendPendingMove]);
 
   const leaveRoom = useCallback(() => {
+    if (trailingTimerRef.current !== null) {
+      clearTimeout(trailingTimerRef.current);
+      trailingTimerRef.current = null;
+    }
+    pendingPosition.current = null;
     socketRef.current?.disconnect();
     setJoined(false);
     setConnected(false);
@@ -266,7 +288,7 @@ export default function PresencePlayground() {
 
             {joined && localUser && (
               <div
-                className="remote-cursor"
+                className="remote-cursor local"
                 style={{ left: `${localUser.x}%`, top: `${localUser.y}%` }}
                 aria-label="Your pointer"
               >
