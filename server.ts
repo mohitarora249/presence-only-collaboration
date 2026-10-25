@@ -20,7 +20,7 @@ type CursorPresence = {
 
 type ClientToServerEvents = {
   "presence:join": (payload: { name: string; roomId: string }) => void;
-  "presence:move": (payload: { x: number; y: number }) => void;
+  "presence:move": (payload: { x: number; y: number; final?: boolean }) => void;
 };
 
 type ServerToClientEvents = {
@@ -170,8 +170,13 @@ async function main() {
       socket.data.presence = updated;
       rooms.get(updated.roomId)?.set(updated.clientId, updated);
 
-      // The sender already renders its own local cursor.
-      socket.to(updated.roomId).emit("presence:updated", updated);
+      // The sender already renders its own local cursor. In-flight moves are
+      // volatile so a slow receiver skips stale positions instead of queueing
+      // them; the final resting position is delivered reliably.
+      const broadcast = payload?.final === true
+        ? socket.to(updated.roomId)
+        : socket.volatile.to(updated.roomId);
+      broadcast.emit("presence:updated", updated);
     });
 
     socket.on("disconnect", () => {

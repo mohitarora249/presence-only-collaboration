@@ -24,7 +24,7 @@ type ServerToClientEvents = {
 
 type ClientToServerEvents = {
   "presence:join": (payload: { name: string; roomId: string }) => void;
-  "presence:move": (payload: { x: number; y: number }) => void;
+  "presence:move": (payload: { x: number; y: number; final?: boolean }) => void;
 };
 
 type PresenceSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -32,6 +32,12 @@ type PresenceSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 const DEFAULT_NAME = `Guest ${Math.floor(100 + Math.random() * 900)}`;
 const DEFAULT_ROOM = "team-room";
 const MOVE_SEND_INTERVAL_MS = 35;
+const MOVE_SETTLE_DELAY_MS = 100;
+// Time constant for easing remote cursors toward their latest position. Roughly the
+// send interval, so motion stays continuous between updates without adding much lag.
+const REMOTE_SMOOTHING_MS = 40;
+// Distance (in canvas %) below which a remote cursor snaps to its target and stops animating.
+const REMOTE_SNAP_EPSILON = 0.01;
 
 function initials(name: string) {
   return name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("") || "?";
@@ -52,6 +58,7 @@ export default function PresencePlayground() {
   const pendingPosition = useRef<{ x: number; y: number } | null>(null);
   const frameRef = useRef<number | null>(null);
   const trailingTimerRef = useRef<number | null>(null);
+  const settleTimerRef = useRef<number | null>(null);
 
   const [nameInput, setNameInput] = useState(DEFAULT_NAME);
   const [roomInput, setRoomInput] = useState(DEFAULT_ROOM);
@@ -67,8 +74,12 @@ export default function PresencePlayground() {
   const localPosition = useRef({ x: 50, y: 50 });
   // Remote cursors follow the same pattern: `users` state only holds the roster
   // (join/leave), while live positions live here and are written to the DOM.
+  // remotePositions holds the latest target from the server; remoteRendered holds
+  // where each cursor is currently drawn while it eases toward that target.
   const remotePositions = useRef(new Map<string, { x: number; y: number }>());
+  const remoteRendered = useRef(new Map<string, { x: number; y: number }>());
   const remoteCursorEls = useRef(new Map<string, HTMLDivElement>());
+  const smoothFrameRef = useRef<number | null>(null);
 
   const sortedUsers = useMemo(
     () => [...users].sort((a, b) => a.name.localeCompare(b.name)),
@@ -81,6 +92,41 @@ export default function PresencePlayground() {
       transports: ["websocket", "polling"]
     });
     socketRef.current = socket;
+
+    // Eases every remote cursor toward its target once per frame. The loop only runs
+    // while some cursor is still moving, and stops itself once all have arrived.
+    let lastSmoothTick = 0;
+    const smoothTick = (now: number) => {
+      // Frame-rate independent exponential easing; a long gap (e.g. a background tab)
+      // makes alpha ~1 so cursors snap instead of crawling across the canvas.
+      const alpha = 1 - Math.exp(-(now - lastSmoothTick) / REMOTE_SMOOTHING_MS);
+      lastSmoothTick = now;
+      let moving = false;
+
+      for (const [clientId, target] of remotePositions.current) {
+        const rendered = remoteRendered.current.get(clientId) ?? target;
+        let x = rendered.x + (target.x - rendered.x) * alpha;
+        let y = rendered.y + (target.y - rendered.y) * alpha;
+
+        if (Math.abs(target.x - x) < REMOTE_SNAP_EPSILON && Math.abs(target.y - y) < REMOTE_SNAP_EPSILON) {
+          x = target.x;
+          y = target.y;
+        } else {
+          moving = true;
+        }
+
+        remoteRendered.current.set(clientId, { x, y });
+        const el = remoteCursorEls.current.get(clientId);
+        if (el) el.style.transform = `translate(${x}%, ${y}%)`;
+      }
+
+      smoothFrameRef.current = moving ? requestAnimationFrame(smoothTick) : null;
+    };
+    const startSmoothing = () => {
+      if (smoothFrameRef.current !== null) return;
+      lastSmoothTick = performance.now();
+      smoothFrameRef.current = requestAnimationFrame(smoothTick);
+    };
 
     socket.on("connect", () => {
       setConnected(true);
@@ -97,6 +143,7 @@ export default function PresencePlayground() {
       setConnected(false);
       setUsers([]);
       remotePositions.current.clear();
+      remoteRendered.current.clear();
     });
 
     socket.on("connect_error", () => {
@@ -107,6 +154,10 @@ export default function PresencePlayground() {
       remotePositions.current = new Map(
         incoming.map((user) => [user.clientId, { x: user.x, y: user.y }])
       );
+      // Existing participants appear at their current spot rather than gliding in.
+      remoteRendered.current = new Map(
+        incoming.map((user) => [user.clientId, { x: user.x, y: user.y }])
+      );
       setUsers(incoming);
       setJoined(true);
       setError("");
@@ -114,6 +165,7 @@ export default function PresencePlayground() {
 
     socket.on("presence:joined", (incoming) => {
       remotePositions.current.set(incoming.clientId, { x: incoming.x, y: incoming.y });
+      remoteRendered.current.set(incoming.clientId, { x: incoming.x, y: incoming.y });
       setUsers((current) => current.some((user) => user.clientId === incoming.clientId)
         ? current
         : [...current, incoming]);
@@ -123,12 +175,12 @@ export default function PresencePlayground() {
       // Ignore updates for clients we haven't seen join, as before.
       if (!remotePositions.current.has(incoming.clientId)) return;
       remotePositions.current.set(incoming.clientId, { x: incoming.x, y: incoming.y });
-      const el = remoteCursorEls.current.get(incoming.clientId);
-      if (el) el.style.transform = `translate(${incoming.x}%, ${incoming.y}%)`;
+      startSmoothing();
     });
 
     socket.on("presence:left", ({ clientId }) => {
       remotePositions.current.delete(clientId);
+      remoteRendered.current.delete(clientId);
       setUsers((current) => current.filter((user) => user.clientId !== clientId));
     });
 
@@ -139,7 +191,9 @@ export default function PresencePlayground() {
       socket.disconnect();
       socketRef.current = null;
       if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+      if (smoothFrameRef.current !== null) cancelAnimationFrame(smoothFrameRef.current);
       if (trailingTimerRef.current !== null) clearTimeout(trailingTimerRef.current);
+      if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
     };
   }, []);
 
@@ -177,7 +231,9 @@ export default function PresencePlayground() {
   const sendPendingMove = useCallback(() => {
     const position = pendingPosition.current;
     if (!position) return;
-    socketRef.current?.emit("presence:move", position);
+    // Volatile: if the transport isn't ready, drop this move rather than buffering it;
+    // only the latest position matters and stale ones would replay as lag.
+    socketRef.current?.volatile.emit("presence:move", position);
     pendingPosition.current = null;
     lastMoveSentAt.current = Date.now();
   }, []);
@@ -195,6 +251,14 @@ export default function PresencePlayground() {
       localCursorRef.current.style.transform = `translate(${x}%, ${y}%)`;
     }
     pendingPosition.current = { x, y };
+
+    // Moves are volatile and may be dropped under congestion, so once the pointer
+    // settles, send its resting position reliably.
+    if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = window.setTimeout(() => {
+      settleTimerRef.current = null;
+      socketRef.current?.emit("presence:move", { x, y, final: true });
+    }, MOVE_SETTLE_DELAY_MS);
 
     // Coalesce high-frequency pointer events to at most one send per animation frame,
     // with a small time gate to avoid flooding the socket. A send already scheduled
@@ -220,6 +284,10 @@ export default function PresencePlayground() {
     if (trailingTimerRef.current !== null) {
       clearTimeout(trailingTimerRef.current);
       trailingTimerRef.current = null;
+    }
+    if (settleTimerRef.current !== null) {
+      clearTimeout(settleTimerRef.current);
+      settleTimerRef.current = null;
     }
     pendingPosition.current = null;
     socketRef.current?.disconnect();
@@ -318,7 +386,10 @@ export default function PresencePlayground() {
             )}
 
             {users.map((user) => {
-              const position = remotePositions.current.get(user.clientId) ?? user;
+              // Use the drawn position so a re-render mid-glide doesn't jump the cursor.
+              const position = remoteRendered.current.get(user.clientId)
+                ?? remotePositions.current.get(user.clientId)
+                ?? user;
               return (
                 <div
                   className="cursor-layer"
@@ -327,7 +398,7 @@ export default function PresencePlayground() {
                     if (el) remoteCursorEls.current.set(user.clientId, el);
                     else remoteCursorEls.current.delete(user.clientId);
                   }}
-                  // Seeds the position on mount; presence:updated writes it directly afterwards.
+                  // Seeds the position on mount; the smoothing loop writes it directly afterwards.
                   style={{ transform: `translate(${position.x}%, ${position.y}%)` }}
                 >
                   <div className="remote-cursor" aria-label={`${user.name}'s pointer`}>

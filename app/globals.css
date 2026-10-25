@@ -170,16 +170,14 @@ button { cursor: pointer; }
 
 /* Full-canvas layer per cursor: translate() percentages resolve against the layer's
    own size, which equals the canvas, so x%/y% map straight to canvas coordinates.
-   Animating transform stays on the compositor instead of re-running layout. */
+   Moving via transform skips layout. Remote cursors are eased in JS (see
+   REMOTE_SMOOTHING_MS), so no CSS transition here. */
 .cursor-layer {
   position: absolute;
   inset: 0;
   z-index: 20;
   pointer-events: none;
-  transition: transform 45ms linear;
 }
-/* The local cursor tracks the real pointer directly; easing it only adds lag. */
-.cursor-layer.local { transition: none; }
 .remote-cursor {
   position: absolute;
   top: 0;
