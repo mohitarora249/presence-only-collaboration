@@ -168,15 +168,24 @@ button { cursor: pointer; }
 .demo-card.one { top: 23%; left: 12%; }
 .demo-card.two { top: 52%; left: 48%; }
 
-.remote-cursor {
+/* Full-canvas layer per cursor: translate() percentages resolve against the layer's
+   own size, which equals the canvas, so x%/y% map straight to canvas coordinates.
+   Animating transform stays on the compositor instead of re-running layout. */
+.cursor-layer {
   position: absolute;
+  inset: 0;
   z-index: 20;
   pointer-events: none;
-  transform: translate(-2px, -2px);
-  transition: left 45ms linear, top 45ms linear;
+  transition: transform 45ms linear;
 }
 /* The local cursor tracks the real pointer directly; easing it only adds lag. */
-.remote-cursor.local { transition: none; }
+.cursor-layer.local { transition: none; }
+.remote-cursor {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform: translate(-2px, -2px);
+}
 .cursor-arrow {
   display: block;
   width: 19px;
